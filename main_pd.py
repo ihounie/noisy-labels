@@ -11,6 +11,10 @@ import wandb
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--lr', type = float, default = 0.1)
+parser.add_argument('--dual_lr', type = float, help="dual learning rate", default=0.1)
+parser.add_argument('--perturbation_lr', type = float, help="perturbation (u) learning rate", default=1)
+parser.add_argument('--penalization', type = str, help="huber, l2 or linear", default="huber")
+parser.add_argument('--huber_delta', type = float, help="huber delta parameter", default=0.2)
 parser.add_argument('--noise_type', type = str, help='clean, aggre, worst, rand1, rand2, rand3, clean100, noisy100', default='clean')
 parser.add_argument('--noise_path', type = str, help='path of CIFAR-10_human.pt', default=None)
 parser.add_argument('--dataset', type = str, help = ' cifar10 or cifar100', default = 'cifar10')
@@ -22,6 +26,17 @@ parser.add_argument('--wandb_log', action='store_true', default=False)
 parser.add_argument('--project', type = str, help="wandb project name", default="CIFARN")
 parser.add_argument('--run', type = str, help="wandb run name", default="Baseline")
 parser.add_argument('--is_human', action='store_true', default=False)
+
+class Huber_loss:
+    def __init__(self, delta=0.2):
+        self.delta=delta
+        self.slope = 1
+    def eval(self, u):
+        return 0.5*(torch.abs(u)<=self.delta)*u**2 + self.delta*(u>self.delta)(torch.abs(u)-0.5*self.delta)
+
+    def grad(self, u):
+        return (torch.abs(u)<=self.delta)*u + (u>self.delta)
+
 
 # Adjust learning rate and for SGD Optimizer
 def adjust_learning_rate(optimizer, epoch,alpha_plan):
@@ -46,7 +61,7 @@ def accuracy(logit, target, topk=(1,)):
     return res
 
 # Train the Model
-def train(epoch, train_loader, model, optimizer):
+def train(epoch, train_loader, model, optimizer, lambdas, u):
     train_total=0
     train_correct=0
 
@@ -65,18 +80,42 @@ def train(epoch, train_loader, model, optimizer):
         train_total+=1
         train_correct+=prec
         loss = F.cross_entropy(logits, labels, reduce = True)
-
+        slacks = loss - u[indexes]
+        lagrangian = loss + lambdas[indexes]*slacks
+        # primal update
         optimizer.zero_grad()
-        loss.backward()
+        lagrangian.backward()
         optimizer.step()
+        # perturbation update
+        u[indexes] = F.relu(u[indexes]+args.perturbation_lr*(h.grad(u)-lambdas[indexes]))
+        # Dual Update
+        lambdas[indexes] = F.relu(lambdas[indexes]+args.dual_lr*slacks)
         if (i+1) % args.print_freq == 0:
             print ('Epoch [%d/%d], Iter [%d/%d] Training Accuracy: %.4F, Loss: %.4f'
                   %(epoch+1, args.n_epoch, i+1, len(train_dataset)//batch_size, prec, loss.data))
 
-
     train_acc=float(train_correct)/float(train_total)
     return train_acc
 
+# Update duals
+def dual_update(train_loader, model, lambdas, u, h):
+    model.eval()
+    with torch.no_grad():
+        for i, (images, labels, indexes) in enumerate(train_loader):
+            ind=indexes.cpu().numpy().transpose()
+        
+            images = Variable(images).cuda()
+            labels = Variable(labels).cuda()
+        
+            # Forward + Backward + Optimize
+            logits = model(images)
+            loss = F.cross_entropy(logits, labels, reduce = True)
+            slacks = loss - u[indexes]
+            # perturbation update
+            u[indexes] = F.relu(u[indexes]+args.perturbation_lr*(h.grad(u)-lambdas[indexes]))
+            # Dual Update
+            lambdas[indexes] = F.relu(lambdas[indexes]+args.dual_lr*slacks)
+    return lambdas, u
 # Evaluate the Model
 def evaluate(test_loader, model):
     model.eval()    # Change model to 'eval' mode.
@@ -145,19 +184,27 @@ test_loader = torch.utils.data.DataLoader(dataset=test_dataset,
                                   shuffle=False)
 alpha_plan = [0.1] * 60 + [0.01] * 40
 model.cuda()
-
-
+print('Initialising Dual Variables & Perturbation...')
+lambdas = torch.zeros(num_training_samples)
+u = torch.ones(num_training_samples)
 epoch=0
 train_acc = 0
-
+if args.penalization == "huber":
+    h = Huber_loss(delta=args.huber_delta)
+else:
+    raise NotImplementedError
 # training
 noise_prior_cur = noise_prior
 for epoch in range(args.n_epoch):
 # train models
     print(f'epoch {epoch}')
+    if args.wandb_log:
+
     adjust_learning_rate(optimizer, epoch, alpha_plan)
     model.train()
-    train_acc = train(epoch, train_loader, model, optimizer)
+    train_acc = train(epoch, train_loader, model, optimizer, lambdas, u)
+    # Update duals
+    lambdas, u = dual_update(train_loader, model, lambdas, u, h)
     # evaluate models
     test_acc = evaluate(test_loader=test_loader, model=model)
     # save results
