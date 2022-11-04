@@ -7,6 +7,7 @@ from data.datasets import input_dataset
 from models import *
 import argparse
 import wandb
+import numpy as np
 
 
 parser = argparse.ArgumentParser()
@@ -23,8 +24,9 @@ parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--print_freq', type=int, default=50)
 parser.add_argument('--num_workers', type=int, default=4, help='how many subprocesses to use for data loading')
 parser.add_argument('--wandb_log', action='store_true', default=False)
+parser.add_argument('--num_log', type=int, default=200, help="how many lambdas/u's to wandb")
 parser.add_argument('--project', type = str, help="wandb project name", default="CIFARN")
-parser.add_argument('--run', type = str, help="wandb run name", default="Baseline")
+parser.add_argument('--run', type = str, help="wandb run name", default="Resilient")
 parser.add_argument('--is_human', action='store_true', default=False)
 
 class Huber_loss:
@@ -36,6 +38,12 @@ class Huber_loss:
 
     def grad(self, u):
         return (torch.abs(u)<=self.delta)*u + (u>self.delta)
+
+def log_histogram(metric, key):
+    np_hist = metric, np.arange(len(metric)+1)
+    wandb.log({f"{key} values": wandb.Histogram(np_histogram=np_hist)})
+    wandb.log({f"{key} histogram": wandb.Histogram(metric)})
+    return
 
 
 # Adjust learning rate and for SGD Optimizer
@@ -66,30 +74,23 @@ def train(epoch, train_loader, model, optimizer, lambdas, u):
     train_correct=0
 
     for i, (images, labels, indexes) in enumerate(train_loader):
-        ind=indexes.cpu().numpy().transpose()
-        batch_size = len(ind)
-       
+        batch_size = len(images)
         images = Variable(images).cuda()
         labels = Variable(labels).cuda()
-       
+        indexes = Variable(indexes).cuda()
         # Forward + Backward + Optimize
         logits = model(images)
-
         prec, _ = accuracy(logits, labels, topk=(1, 5))
         # prec = 0.0
         train_total+=1
         train_correct+=prec
         loss = F.cross_entropy(logits, labels, reduce = True)
         slacks = loss - u[indexes]
-        lagrangian = loss + lambdas[indexes]*slacks
+        lagrangian = loss + torch.sum(lambdas[indexes]*slacks)
         # primal update
-        optimizer.zero_grad()
         lagrangian.backward()
         optimizer.step()
-        # perturbation update
-        u[indexes] = F.relu(u[indexes]+args.perturbation_lr*(h.grad(u)-lambdas[indexes]))
-        # Dual Update
-        lambdas[indexes] = F.relu(lambdas[indexes]+args.dual_lr*slacks)
+        optimizer.zero_grad()
         if (i+1) % args.print_freq == 0:
             print ('Epoch [%d/%d], Iter [%d/%d] Training Accuracy: %.4F, Loss: %.4f'
                   %(epoch+1, args.n_epoch, i+1, len(train_dataset)//batch_size, prec, loss.data))
@@ -112,7 +113,7 @@ def dual_update(train_loader, model, lambdas, u, h):
             loss = F.cross_entropy(logits, labels, reduce = True)
             slacks = loss - u[indexes]
             # perturbation update
-            u[indexes] = F.relu(u[indexes]+args.perturbation_lr*(h.grad(u)-lambdas[indexes]))
+            u[indexes] = F.relu(u[indexes]+args.perturbation_lr*(h.grad(u[indexes])-lambdas[indexes]))
             # Dual Update
             lambdas[indexes] = F.relu(lambdas[indexes]+args.dual_lr*slacks)
     return lambdas, u
@@ -131,8 +132,6 @@ def evaluate(test_loader, model):
     acc = 100*float(correct)/float(total)
 
     return acc
-
-
 
 #####################################main code ################################################
 args = parser.parse_args()
@@ -163,6 +162,11 @@ if args.noise_path is None:
 train_dataset,test_dataset,num_classes,num_training_samples = input_dataset(args.dataset,args.noise_type, args.noise_path, args.is_human)
 noise_prior = train_dataset.noise_prior
 noise_or_not = train_dataset.noise_or_not
+if args.wandb_log:
+    indexes = np.arange(len(train_dataset))
+    log_idxs = {}
+    log_idxs["noisy"] = indexes[noise_or_not][:args.num_log]
+    log_idxs["clean"] = indexes[~noise_or_not][:args.num_log]
 print('train_labels:', len(train_dataset.train_labels), train_dataset.train_labels[:10])
 # load model
 print('building model...')
@@ -185,8 +189,8 @@ test_loader = torch.utils.data.DataLoader(dataset=test_dataset,
 alpha_plan = [0.1] * 60 + [0.01] * 40
 model.cuda()
 print('Initialising Dual Variables & Perturbation...')
-lambdas = torch.zeros(num_training_samples)
-u = torch.ones(num_training_samples)
+lambdas = torch.zeros(num_training_samples).cuda()
+u = torch.ones(num_training_samples).cuda()
 epoch=0
 train_acc = 0
 if args.penalization == "huber":
@@ -198,8 +202,6 @@ noise_prior_cur = noise_prior
 for epoch in range(args.n_epoch):
 # train models
     print(f'epoch {epoch}')
-    if args.wandb_log:
-
     adjust_learning_rate(optimizer, epoch, alpha_plan)
     model.train()
     train_acc = train(epoch, train_loader, model, optimizer, lambdas, u)
@@ -210,4 +212,11 @@ for epoch in range(args.n_epoch):
     # save results
     print('train acc on train images is ', train_acc)
     print('test acc on test images is ', test_acc)
-    wandb.log({"train acc": train_acc, "test_acc": test_acc, "epoch":epoch})
+    if args.wandb_log:
+        wandb.log({"train acc": train_acc, "test_acc": test_acc, "epoch":epoch})
+        for array, name in zip([lambdas, u], ["dual variable", "perturbation"]):
+            for mode, idxs in log_idxs.items():
+                log_histogram(array.cpu().numpy()[idxs], f"{name} {mode}")
+
+
+        
