@@ -8,14 +8,18 @@ from models import *
 import argparse
 import wandb
 import numpy as np
+from utils.utils import setup_gpus
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--lr', type = float, default = 0.1)
-parser.add_argument('--dual_lr', type = float, help="dual learning rate", default=0.1)
+parser.add_argument('--dual_lr', type = float, help="dual learning rate", default=1)
 parser.add_argument('--perturbation_lr', type = float, help="perturbation (u) learning rate", default=1)
 parser.add_argument('--penalization', type = str, help="huber, l2 or linear", default="huber")
 parser.add_argument('--huber_delta', type = float, help="huber delta parameter", default=0.2)
+parser.add_argument('--huber_a', type = float, help="huber quadratic parameter", default=10)
+parser.add_argument('--grad_clip', type = float, help="gradient clipping", default=1.0)
+parser.add_argument('--epsilon', type = float, help="constraint level", default=0.6)
 parser.add_argument('--noise_type', type = str, help='clean, aggre, worst, rand1, rand2, rand3, clean100, noisy100', default='clean')
 parser.add_argument('--noise_path', type = str, help='path of CIFAR-10_human.pt', default=None)
 parser.add_argument('--dataset', type = str, help = ' cifar10 or cifar100', default = 'cifar10')
@@ -30,14 +34,15 @@ parser.add_argument('--run', type = str, help="wandb run name", default="Resilie
 parser.add_argument('--is_human', action='store_true', default=False)
 
 class Huber_loss:
-    def __init__(self, delta=0.2):
+    def __init__(self, delta=0.5, a=1.0):
         self.delta=delta
         self.slope = 1
+        self.a = a
     def eval(self, u):
-        return 0.5*(torch.abs(u)<=self.delta)*u**2 + self.delta*(u>self.delta)(torch.abs(u)-0.5*self.delta)
+        return self.a*0.5*(torch.abs(u)<= self.delta)*u**2 + self.a*self.delta*(u>self.delta)(torch.abs(u)-0.5*self.delta)
 
     def grad(self, u):
-        return (torch.abs(u)<=self.delta)*u + (u>self.delta)
+        return self.a*(torch.abs(u)<=self.delta) * u + self.a*self.delta * (u>self.delta)
 
 def log_histogram(metric, key):
     np_hist = metric, np.arange(len(metric)+1)
@@ -85,11 +90,20 @@ def train(epoch, train_loader, model, optimizer, lambdas, u):
         train_total+=1
         train_correct+=prec
         loss = F.cross_entropy(logits, labels, reduce = True)
-        slacks = loss - u[indexes]
-        lagrangian = loss + torch.sum(lambdas[indexes]*slacks)
+        slacks = loss - u[indexes] - args.epsilon
+        lagrangian = torch.sum(lambdas[indexes]*slacks)
         # primal update
         lagrangian.backward()
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
+        try:
+            assert(not torch.isnan(lagrangian))
+        except:
+            print(loss)
+            print(slacks)
+            print(lambdas[indexes])
+            assert(0)
         optimizer.zero_grad()
         if (i+1) % args.print_freq == 0:
             print ('Epoch [%d/%d], Iter [%d/%d] Training Accuracy: %.4F, Loss: %.4f'
@@ -111,9 +125,9 @@ def dual_update(train_loader, model, lambdas, u, h):
             # Forward + Backward + Optimize
             logits = model(images)
             loss = F.cross_entropy(logits, labels, reduce = True)
-            slacks = loss - u[indexes]
+            slacks = loss - u[indexes] - args.epsilon
             # perturbation update
-            u[indexes] = F.relu(u[indexes]+args.perturbation_lr*(h.grad(u[indexes])-lambdas[indexes]))
+            u[indexes] = F.relu(u[indexes]-args.perturbation_lr*(h.grad(u[indexes])-lambdas[indexes]))
             # Dual Update
             lambdas[indexes] = F.relu(lambdas[indexes]+args.dual_lr*slacks)
     return lambdas, u
@@ -132,6 +146,13 @@ def evaluate(test_loader, model):
     acc = 100*float(correct)/float(total)
 
     return acc
+
+########################
+# choose and config GPU
+########################
+best_gpu = setup_gpus()
+torch.cuda.set_device(best_gpu)
+torch.backends.cudnn.benchmark = True
 
 #####################################main code ################################################
 args = parser.parse_args()
@@ -179,9 +200,6 @@ train_loader = torch.utils.data.DataLoader(dataset = train_dataset,
                                    num_workers=args.num_workers,
                                    shuffle=True)
 
-
-
-
 test_loader = torch.utils.data.DataLoader(dataset=test_dataset,
                                   batch_size = 64,
                                   num_workers=args.num_workers,
@@ -189,12 +207,12 @@ test_loader = torch.utils.data.DataLoader(dataset=test_dataset,
 alpha_plan = [0.1] * 60 + [0.01] * 40
 model.cuda()
 print('Initialising Dual Variables & Perturbation...')
-lambdas = torch.zeros(num_training_samples).cuda()
+lambdas = torch.ones(num_training_samples).cuda()/128
 u = torch.ones(num_training_samples).cuda()
 epoch=0
 train_acc = 0
 if args.penalization == "huber":
-    h = Huber_loss(delta=args.huber_delta)
+    h = Huber_loss(delta=args.huber_delta, a=args.huber_a)
 else:
     raise NotImplementedError
 # training
