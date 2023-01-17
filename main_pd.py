@@ -77,7 +77,7 @@ def accuracy(logit, target, topk=(1,)):
 def train(epoch, train_loader, model, optimizer, lambdas, u):
     train_total=0
     train_correct=0
-
+    model.train()
     for i, (images, labels, indexes) in enumerate(train_loader):
         batch_size = len(images)
         images = Variable(images).cuda()
@@ -117,7 +117,7 @@ def dual_update(train_loader, model, lambdas, u, h):
     model.eval()
     with torch.no_grad():
         for i, (images, labels, indexes) in enumerate(train_loader):
-            ind=indexes.cpu().numpy().transpose()
+            #ind=indexes.cpu().numpy().transpose()
         
             images = Variable(images).cuda()
             labels = Variable(labels).cuda()
