@@ -32,7 +32,7 @@ parser.add_argument('--wandb_log', action='store_true', default=False)
 parser.add_argument('--num_log', type=int, default=200, help="how many lambdas/u's to wandb")
 parser.add_argument('--project', type = str, help="wandb project name", default="CIFARN")
 parser.add_argument('--run', type = str, help="wandb run name", default="Resilient")
-parser.add_argument('--u_init', type = float, help="perturbation init", default=0)
+parser.add_argument('--u_init', type = str, help="wether to init the perturbation at 1", default="ones")
 parser.add_argument('--is_human', action='store_true', default=False)
 parser.add_argument('--dual_thresh', type = float, default=-1.0, help = 'if duals go below this thresh turn off PD')
 
@@ -53,10 +53,17 @@ def log_histogram(metric, key):
     wandb.log({f"{key} histogram": wandb.Histogram(metric)})
     return
 
+
 # Adjust learning rate and for SGD Optimizer
-def adjust_learning_rate(optimizer, epoch,alpha_plan):
-    for param_group in optimizer.param_groups:
-        param_group['lr']=alpha_plan[epoch]
+def adjust_learning_rate(optimizer, epoch,initial_lr, decayed_lr, lambdas, min_epoch=10):
+    if epoch>min_epoch and torch.mean(lambdas)<args.dual_thresh:
+        for param_group in optimizer.param_groups:
+            param_group['lr']=decayed_lr
+        return True
+    else:
+        for param_group in optimizer.param_groups:
+            param_group['lr']= initial_lr
+        return False
         
 
 def accuracy(logit, target, topk=(1,)):
@@ -207,11 +214,15 @@ test_loader = torch.utils.data.DataLoader(dataset=test_dataset,
                                   batch_size = 64,
                                   num_workers=args.num_workers,
                                   shuffle=False)
-alpha_plan = [0.1] * 60 + [0.01] * 40
+initial_lr = 0.1
+decayed_lr = 0.01
 model.cuda()
 print('Initialising Dual Variables & Perturbation...')
 lambdas = torch.zeros(num_training_samples).cuda()
-u = args.u_init*torch.ones(num_training_samples).cuda()
+if args.u_init == "ones":
+    u = torch.ones(num_training_samples).cuda()
+else:
+    u = torch.zeros(num_training_samples).cuda()
 grad_lambdas = torch.zeros_like(lambdas)
 epoch=0
 train_acc = 0
@@ -220,11 +231,13 @@ if args.penalization == "huber":
 else:
     raise NotImplementedError
 # training
+decayed = False
 noise_prior_cur = noise_prior
 for epoch in range(args.n_epoch):
 # train models
     print(f'epoch {epoch}')
-    adjust_learning_rate(optimizer, epoch, alpha_plan)
+    if not decayed:
+        adjust_learning_rate(optimizer, epoch, initial_lr, decayed_lr, lambdas)
     model.train()
     train_acc = train(epoch, train_loader, model, optimizer, lambdas, u)
     # Update duals
